@@ -2,30 +2,51 @@
 import { useEffect, useMemo, useState } from "react";
 import type { DayISO, DayLog, Task } from "../domain/types";
 import { calcScore } from "../domain/scoring";
-import { loadDayLogMap, loadTasks } from "../infra/storage";
+import {
+  listAvailableMonths,
+  loadDayLogMap,
+  loadDayLogMapForMonth,
+  loadTasks,
+} from "../infra/storage";
 import { todayKey, isFutureDay } from "../utils/date";
 
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  CartesianGrid,
+} from "recharts";
 
-type RangeKey = "7" | "30" | "90" | "all";
+type RangeKey = "7" | "30";
+type Mode = "recent" | "month";
+type MonthISO = `${number}-${string}`; // "YYYY-MM"
 
-function isoToDate(iso: DayISO): Date {
-  // "YYYY-MM-DD" を Date に（ローカル時刻）
-  const [y, m, d] = iso.split("-").map(Number);
-  return new Date(y, (m ?? 1) - 1, d ?? 1);
+function toDayISO(d: Date): DayISO {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}` as DayISO;
 }
 
-function toDayISO(date: Date): DayISO {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, "0");
-  const d = String(date.getDate()).padStart(2, "0");
-  return `${y}-${m}-${d}` as DayISO;
+function fmtMMDD(iso: DayISO): string {
+  // "YYYY-MM-DD" -> "MM/DD"
+  return iso.slice(5, 7) + "/" + iso.slice(8, 10);
 }
 
-function cutoffISO(days: number): DayISO {
+function genRecentDays(days: number): DayISO[] {
   const now = new Date();
-  const cut = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  cut.setDate(cut.getDate() - (days - 1));
-  return toDayISO(cut);
+  const base = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const out: DayISO[] = [];
+
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(base);
+    d.setDate(d.getDate() - i);
+    out.push(toDayISO(d));
+  }
+  return out;
 }
 
 function fmtUpdatedAt(ts?: number): string {
@@ -38,212 +59,366 @@ function fmtUpdatedAt(ts?: number): string {
   return `${mm}/${dd} ${hh}:${mi}`;
 }
 
-
-function hasAnyInput(log?: DayLog): boolean {
-  if (!log) return false;
-
-  // 1) メモ
-  const memo = (log as any).note;
-  if (typeof memo === "string" && memo.trim().length > 0) return true;
-
-  // 2) 除外フラグ（明示的操作）
-  if ((log as any).excludeFromStats === true) return true;
-
-  // 3) チェック（完了が1つでも）
-  // プロパティ名が app によって違うので、よくある候補を見て拾う
-  const checks =
-    (log as any).checks ??
-    (log as any).doneMap ??
-    (log as any).doneByTaskId ??
-    (log as any).results;
-
-  if (checks && typeof checks === "object") {
-    for (const v of Object.values(checks as Record<string, unknown>)) {
-      if (v === true) return true;
-    }
-  }
-
-  return false;
+function roundScore(value: number | null | undefined): number | null {
+  if (value == null) return null;
+  return Math.round(value);
 }
 
+function monthLabel(m: MonthISO): string {
+  // "YYYY-MM" -> "YYYY年MM月"
+  const y = m.slice(0, 4);
+  const mm = m.slice(5, 7);
+  return `${y}年${mm}月`;
+}
 
 export default function History() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [logs, setLogs] = useState<Record<DayISO, DayLog>>({});
-  const [range, setRange] = useState<RangeKey>("30");
+
+  // 表示モード
+  const [mode, setMode] = useState<Mode>("recent");
+
+  // デフォは直近7日、30日はオプション
+  const [range, setRange] = useState<RangeKey>("7");
+
+  // 月遡り
+  const [months, setMonths] = useState<MonthISO[]>([]);
+  const [selectedMonth, setSelectedMonth] = useState<MonthISO | "">("");
+
   const [includeExcluded, setIncludeExcluded] = useState(false);
 
-  // 初期ロード（タブ切替で再読み込みしたいので、mount時に読み直す）
   useEffect(() => {
     setTasks(loadTasks());
+
+    const ms = listAvailableMonths() as MonthISO[];
+    setMonths(ms);
+
+    // 初期の月：今月（データがあればそれ優先）/ なければ最新月
+    const now = todayKey().slice(0, 7) as MonthISO;
+    const initialMonth = (ms.includes(now) ? now : ms[0]) ?? now;
+    setSelectedMonth(initialMonth);
+
+    // recentは全期間マップをロード（軽い規模前提）
     setLogs(loadDayLogMap());
   }, []);
 
-  const rows = useMemo(() => {
-    let dates = Object.keys(logs) as DayISO[];
-    dates = dates.filter((d) => hasAnyInput(logs[d]));
+  // mode/monthが変わったら必要なものをロードし直す（月別は月だけ読む）
+  useEffect(() => {
+    if (mode === "recent") {
+      setLogs(loadDayLogMap());
+      return;
+    }
+    if (selectedMonth) {
+      setLogs(loadDayLogMapForMonth(selectedMonth as MonthISO));
+    }
+  }, [mode, selectedMonth]);
 
-    dates.sort((a, b) => isoToDate(b).getTime() - isoToDate(a).getTime());
+  // ====== グラフデータ ======
+  const chartData = useMemo(() => {
+    const today = todayKey();
 
-    let filtered = dates;
-    // 除外フィルター（デフォルトは含める設計にしたいなら、ここは後で反転させる）
-    if (!includeExcluded) {
-      filtered = filtered.filter((d) => !logs[d]?.excludeFromStats);
+    // 表示対象のdatesを作る
+    let dates: DayISO[] = [];
+
+    if (mode === "recent") {
+      dates = genRecentDays(range === "7" ? 7 : 30);
+    } else {
+      // 月別：その月に存在する日付だけ（0埋めしない）
+      const ds = Object.keys(logs) as DayISO[];
+      dates = ds
+        .filter((d) => !isFutureDay(d, today)) // 未来は除外
+        .sort((a, b) => (a < b ? -1 : 1));
     }
 
-    // 期間フィルター（★filteredを維持したまま絞る）
-    if (range !== "all") {
-      const days = Number(range);
-      const cut = cutoffISO(days);
-      filtered = filtered.filter((d) => d >= cut);
-    }
+    // 除外の扱い：includeExcluded=falseなら null にして線を切る
+    return dates.map((d) => {
+      const log =
+        logs[d] ??
+        ({
+          date: d,
+          checks: {},
+          excludeFromStats: false,
+        } as DayLog);
 
-    return filtered.map((date) => {
-      const log = logs[date];
-      const score = calcScore(tasks, log);
-      return { date, score, updatedAt: log?.updatedAt };
+      const excluded = !!log.excludeFromStats;
+      const score = calcScore(tasks, log).rawScore;
+
+      return {
+        date: d,
+        label: fmtMMDD(d),
+        rawScore: !includeExcluded && excluded ? null : roundScore(score),
+        excluded,
+        updatedAt: log.updatedAt,
+      };
     });
-  }, [logs, tasks, range, includeExcluded]);
+  }, [mode, range, logs, tasks, includeExcluded]);
 
+  // ====== 一覧 ======
+  const rows = useMemo(() => {
+    const today = todayKey();
+    let dates = (Object.keys(logs) as DayISO[]).sort((a, b) => (a < b ? 1 : -1));
 
+    // recentのときだけ：7/30 の範囲に寄せる（一覧の整合性）
+    if (mode === "recent") {
+      const cut = genRecentDays(range === "7" ? 7 : 30)[0];
+      dates = dates.filter((d) => d >= cut);
+    }
 
+    // 未来日除外
+    dates = dates.filter((d) => !isFutureDay(d, today));
+
+    // 除外トグル
+    if (!includeExcluded) {
+      dates = dates.filter((d) => !logs[d]?.excludeFromStats);
+    }
+
+    return dates.map((d) => {
+      const log = logs[d];
+      const scoreRes = calcScore(tasks, log);
+
+      return {
+        date: d,
+        rawScore: roundScore(scoreRes.rawScore),
+        showRank: scoreRes.showRank,
+        rank: scoreRes.rank, // "A" | "S" | "SS" | "SSS"
+        note: log?.note ?? "",
+        updatedAt: log?.updatedAt,
+        excludeFromStats: !!log?.excludeFromStats,
+      };
+    });
+  }, [mode, range, logs, tasks, includeExcluded]);
+
+  // ====== 平均など ======
   const summary = useMemo(() => {
-  // まず「入力がある日」だけにする（rowsと同じ基準）
-  let dates = (Object.keys(logs) as DayISO[]).filter((d) => hasAnyInput(logs[d]));
+    const today = todayKey();
+    let dates = (Object.keys(logs) as DayISO[]).sort();
 
-  // 期間フィルター
-  if (range !== "all") {
-    const days = Number(range);
-    const cut = cutoffISO(days);
-    dates = dates.filter((d) => d >= cut);
-  }
+    // recentのときだけ範囲適用
+    if (mode === "recent") {
+      const cut = genRecentDays(range === "7" ? 7 : 30)[0];
+      dates = dates.filter((d) => d >= cut);
+    }
 
-  // 未来日カウント（透明性）
-  const today = todayKey();
-  const futureDays = dates.filter((d) => isFutureDay(d, today)).length;
+    const futureDays = dates.filter((d) => isFutureDay(d, today)).length;
+    let statsDates = dates.filter((d) => !isFutureDay(d, today));
 
-  // ★集計対象日：未来日除外
-  let statsDates = dates.filter((d) => !isFutureDay(d, today));
+    if (!includeExcluded) {
+      statsDates = statsDates.filter((d) => !logs[d]?.excludeFromStats);
+    }
 
-  // ★除外トグル（平均に含めないがデフォ）
-  if (!includeExcluded) {
-    statsDates = statsDates.filter((d) => !logs[d]?.excludeFromStats);
-  }
+    const excludedDays = dates.filter((d) => logs[d]?.excludeFromStats).length;
 
-  const excludedDays = dates.filter((d) => logs[d]?.excludeFromStats).length;
+    if (statsDates.length === 0) {
+      return { avg: 0, coreMissDays: 0, count: 0, excludedDays, futureDays };
+    }
 
-  if (statsDates.length === 0) {
-    return { avg: 0, coreMissDays: 0, count: 0, excludedDays, futureDays };
-  }
+    let total = 0;
+    let coreMissDays = 0;
 
-  let total = 0;
-  let coreMissDays = 0;
+    for (const d of statsDates) {
+      const log = logs[d];
+      const score = calcScore(tasks, log);
+      total += score.rawScore;
+      if (score.coreIncompleteCount > 0) coreMissDays++;
+    }
 
-  for (const d of statsDates) {
-    const log = logs[d];
-    const score = calcScore(tasks, log);
-    total += score.rawScore;
-    if (score.coreIncompleteCount > 0) coreMissDays += 1;
-  }
-
-  return {
-    avg: total / statsDates.length,
-    coreMissDays,
-    count: statsDates.length,
-    excludedDays,
-    futureDays,
-  };
-}, [logs, tasks, range, includeExcluded]);
+    return {
+      avg: total / statsDates.length,
+      coreMissDays,
+      count: statsDates.length,
+      excludedDays,
+      futureDays,
+    };
+  }, [mode, range, logs, tasks, includeExcluded]);
 
   return (
-    <div style={{ maxWidth: 760, margin: "0 auto", padding: 16 }}>
+    <div style={{ padding: 16, maxWidth: 920, margin: "0 auto" }}>
       <h1>History</h1>
 
-      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
-        <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <span>期間</span>
-          <select value={range} onChange={(e) => setRange(e.target.value as RangeKey)} style={{ padding: "6px 10px", fontSize: 16 }}>
-            <option value="7">直近7日</option>
-            <option value="30">直近30日</option>
-            <option value="90">直近90日</option>
-            <option value="all">全期間</option>
-          </select>
-        </label>
-        <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+      {/* ===== 上部コントロール ===== */}
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            onClick={() => setMode("recent")}
+            style={{
+              padding: "6px 10px",
+              borderRadius: 8,
+              border: "1px solid #ccc",
+              background: mode === "recent" ? "#eee" : "white",
+              cursor: "pointer",
+            }}
+          >
+            直近
+          </button>
+          <button
+            onClick={() => setMode("month")}
+            style={{
+              padding: "6px 10px",
+              borderRadius: 8,
+              border: "1px solid #ccc",
+              background: mode === "month" ? "#eee" : "white",
+              cursor: "pointer",
+            }}
+          >
+            月別
+          </button>
+        </div>
+
+        {mode === "recent" ? (
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={() => setRange("7")}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 8,
+                border: "1px solid #ccc",
+                background: range === "7" ? "#eee" : "white",
+                cursor: "pointer",
+              }}
+            >
+              7日
+            </button>
+            <button
+              onClick={() => setRange("30")}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 8,
+                border: "1px solid #ccc",
+                background: range === "30" ? "#eee" : "white",
+                cursor: "pointer",
+              }}
+            >
+              30日
+            </button>
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <span style={{ opacity: 0.85 }}>月：</span>
+            <select
+              value={selectedMonth}
+              onChange={(e) => setSelectedMonth(e.target.value as MonthISO)}
+              style={{ padding: "6px 10px", borderRadius: 8, border: "1px solid #ccc" }}
+            >
+              {months.length === 0 ? (
+                <option value="">（記録なし）</option>
+              ) : (
+                months.map((m) => (
+                  <option key={m} value={m}>
+                    {monthLabel(m)}
+                  </option>
+                ))
+              )}
+            </select>
+          </div>
+        )}
+
+        <label style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
           <input
             type="checkbox"
             checked={includeExcluded}
             onChange={(e) => setIncludeExcluded(e.target.checked)}
           />
-          <span>集計から除外した日も含める</span>
+          除外日も含める
         </label>
-
-        <button
-          onClick={() => {
-            // 手動リフレッシュ（LocalStorage再読み込み）
-            setTasks(loadTasks());
-            setLogs(loadDayLogMap());
-          }}
-          style={{ padding: "6px 10px" }}
-        >
-          更新
-        </button>
       </div>
 
-      <div style={{ padding: 12, border: "1px solid #ccc", borderRadius: 8, marginBottom: 16 }}>
-        <div style={{ fontSize: 14, opacity: 0.8 }}>対象日数：{summary.count}</div>
+      {/* ===== グラフ ===== */}
+      <div style={{ marginTop: 14, padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>日別 rawScore 推移</div>
+
+        <div style={{ width: "100%", height: 280 }}>
+          <ResponsiveContainer>
+            <LineChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="label" />
+              <YAxis />
+              <Tooltip
+                formatter={(value: any) => (value == null ? "（除外）" : value)}
+                labelFormatter={(label: any, payload: any) => {
+                  const p = payload?.[0]?.payload;
+                  return p?.date ?? label;
+                }}
+              />
+              <Line type="monotone" dataKey="rawScore" dot={false} connectNulls={false} strokeWidth={2} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div style={{ marginTop: 8, opacity: 0.8, fontSize: 12 }}>
+          ※除外日はデフォで線を切ります（「除外日も含める」をONで表示）
+        </div>
+      </div>
+
+      {/* ===== 平均など ===== */}
+      <div style={{ marginTop: 14, padding: 12, border: "1px solid #ddd", borderRadius: 12 }}>
         <div style={{ fontSize: 24, fontWeight: 700 }}>
           平均 rawScore：{summary.avg.toFixed(1)}
         </div>
-        <div style={{ marginTop: 6 }}>
-          最重要未達日数：{summary.coreMissDays}
-        </div>
-        <div style={{ marginTop: 6 }}>
-          除外指定日数：{summary.excludedDays}
-        </div>
+        <div style={{ marginTop: 6 }}>最重要未達日数：{summary.coreMissDays}</div>
+        <div style={{ marginTop: 6 }}>対象日数：{summary.count}</div>
+        <div style={{ marginTop: 6 }}>除外指定日数：{summary.excludedDays}</div>
       </div>
 
-      <h2>日別一覧</h2>
+      {/* ===== 日別一覧 ===== */}
+      <h2 style={{ marginTop: 18 }}>日別一覧</h2>
 
       {rows.length === 0 ? (
         <div style={{ opacity: 0.8 }}>まだ記録がありません（Todayでチェックを入れると蓄積されます）。</div>
       ) : (
-        <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+        <div style={{ display: "grid", gap: 10 }}>
           {rows.map((r) => (
-            <li
+            <div
               key={r.date}
               style={{
-                padding: 10,
-                borderBottom: "1px solid #eee",
-                display: "flex",
-                gap: 10,
-                alignItems: "center",
+                padding: 12,
+                border: "1px solid #ddd",
+                borderRadius: 12,
+                background: r.excludeFromStats ? "#fafafa" : "white",
               }}
             >
-              <div style={{ width: 110, fontFamily: "monospace" }}>{r.date}</div>
-
-              <div style={{ fontSize: 18, fontWeight: 600 }}>
-                {r.score.showRank
-                ? `${r.score.rank} ${r.score.rawScore.toFixed(1)}`
-                : r.score.rawScore.toFixed(1)}
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                <div style={{ fontWeight: 700 }}>{r.date}</div>
+                <div style={{ opacity: 0.8, fontSize: 12 }}>{fmtUpdatedAt(r.updatedAt)}</div>
               </div>
 
-              <div style={{ fontSize: 12, opacity: 0.55 }}>
-                {r.updatedAt ? `更新: ${fmtUpdatedAt(r.updatedAt)}` : ""}
-              </div>
-              <div style={{ marginLeft: "auto", opacity: 0.75 }}>
-                最重要未達：{r.score.coreIncompleteCount}
+              <div
+                style={{
+                  marginTop: 6,
+                  fontSize: 18,
+                  display: "flex",
+                  gap: 10,
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  rawScore：<b>{r.rawScore}</b>
+                  {r.excludeFromStats ? (
+                    <span style={{ marginLeft: 8, opacity: 0.7 }}>（除外）</span>
+                  ) : null}
+                </div>
+
+                {r.showRank && r.rank ? (
+                  <span
+                    style={{
+                      padding: "2px 10px",
+                      borderRadius: 999,
+                      border: "1px solid #ccc",
+                      fontWeight: 700,
+                      fontSize: 14,
+                    }}
+                    title="最重要タスク全達成時のみランク表示"
+                  >
+                    Rank {r.rank}
+                  </span>
+                ) : null}
               </div>
 
-
-            </li>
+              {r.note ? <div style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{r.note}</div> : null}
+            </div>
           ))}
-        </ul>
+        </div>
       )}
-
-      <div style={{ marginTop: 14, opacity: 0.65, fontSize: 12 }}>
-        ※ 現状は「現在のタスク定義」で過去ログを再計算します。将来、日次にタスクスナップショットを保存すると過去スコアがブレません。
-      </div>
     </div>
   );
 }
